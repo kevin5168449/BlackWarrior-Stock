@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+from FinMind.data import DataLoader
 
 # ==========================================
 # 0. 系統設定
@@ -20,7 +21,7 @@ try:
     st.set_page_config(page_title="黑武士・全能戰情室", layout="wide", page_icon="⚔️")
 except: pass
 
-HISTORY_FILE = "screening_history.csv" # 本地端使用相對路徑
+HISTORY_FILE = "/content/drive/MyDrive/screening_history.csv"
 
 # 白名單
 VALID_STRATEGIES = [
@@ -91,7 +92,7 @@ def clear_history():
 clean_invalid_data()
 
 # ==========================================
-# 2. 數據獲取
+# 2. 數據獲取 (核心函數 - 優先加載)
 # ==========================================
 
 @st.cache_data(ttl=86400)
@@ -164,7 +165,6 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# 抓取原始數據 (極速版)
 def fetch_raw_data(ticker, period="1y"):
     ticker = ticker.strip().upper()
     if not (ticker.endswith(".TW") or ticker.endswith(".TWO")): ticker = f"{ticker}.TW"
@@ -176,7 +176,6 @@ def fetch_raw_data(ticker, period="1y"):
     except: pass
     return None
 
-# 計算指標 (極速版)
 def add_technical_indicators(data_df):
     try:
         data_df['MA5'] = data_df['Close'].rolling(window=5).mean()
@@ -189,17 +188,6 @@ def add_technical_indicators(data_df):
         return data_df
     except: return None
 
-# ★★★ 關鍵修正：補回 fetch_stock_data 供 Tab 4 & Tab 8 使用 ★★★
-def fetch_stock_data(ticker, period="5y"):
-    """
-    整合函式：抓取原始數據並計算指標，供回測系統使用
-    """
-    df = fetch_raw_data(ticker, period)
-    if df is not None:
-        df = add_technical_indicators(df)
-    return df
-
-# 基本面
 def get_stock_fundamentals_safe(ticker):
     try:
         if not ticker.endswith('.TW') and not ticker.endswith('.TWO'): ticker += '.TW'
@@ -210,6 +198,11 @@ def get_stock_fundamentals_safe(ticker):
         roe = info.get('returnOnEquity', None)
         return eps, pe, roe
     except: return None, None, None
+
+# ★★★ 關鍵修正：加入偽裝 Headers，騙過證交所防火牆 ★★★
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
 
 # --- 營收 (MOPS) ---
 @st.cache_data(ttl=3600)
@@ -232,8 +225,8 @@ def get_revenue_data_snapshot():
         has_data = False
         for url in urls:
             try:
-                headers = {'User-Agent': 'Mozilla/5.0'}
-                res = requests.get(url, headers=headers, timeout=3, verify=False)
+                # ★ 加入 Headers
+                res = requests.get(url, headers=HEADERS, timeout=10, verify=False)
                 res.encoding = 'utf-8'
                 dfs = pd.read_html(res.text)
                 for df in dfs:
@@ -259,16 +252,17 @@ def get_revenue_data_snapshot():
             except: pass
         if has_data: return revenue_map, f"{roc_year}/{month}"
         target_month = target_month.replace(day=1) - timedelta(days=1)
-    return {}, "無資料"
+    return {}, "無資料 (連線逾時)"
 
-# --- 融資 ---
+# --- 融資 (TWSE + TPEx) ---
 @st.cache_data(ttl=3600)
 def get_tpex_margin_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
     date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
     url = f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={date_str}&s=0,asc,0"
     try:
-        res = requests.get(url, timeout=5)
+        # ★ 加入 Headers
+        res = requests.get(url, headers=HEADERS, timeout=10)
         data = res.json()
         if 'aaData' in data:
             margin_dict = {}
@@ -296,7 +290,8 @@ def get_margin_data_snapshot():
         twse_dict = {}
         try:
             url = f"https://www.twse.com.tw/rwd/zh/margin/MI_MARGN?date={date_str}&selectType=STOCK&response=json"
-            res = requests.get(url, timeout=5)
+            # ★ 加入 Headers
+            res = requests.get(url, headers=HEADERS, timeout=10)
             data = res.json()
             if data['stat'] == 'OK':
                 for table in data.get('tables', []):
@@ -317,14 +312,15 @@ def get_margin_data_snapshot():
         date_obj -= timedelta(days=1)
     return {}
 
-# --- 籌碼 ---
+# --- 籌碼 (TWSE + TPEx) ---
 @st.cache_data(ttl=3600)
 def get_tpex_chip_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
     date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
     url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=EW&t=D&d={date_str}"
     try:
-        res = requests.get(url, timeout=5)
+        # ★ 加入 Headers
+        res = requests.get(url, headers=HEADERS, timeout=10)
         data = res.json()
         if 'aaData' in data:
             chip_dict = {}
@@ -350,7 +346,8 @@ def get_chip_data_snapshot():
         twse_dict = {}
         try:
             url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_str_twse}&selectType=ALL&response=json"
-            res = requests.get(url, timeout=5)
+            # ★ 加入 Headers
+            res = requests.get(url, headers=HEADERS, timeout=10)
             data = res.json()
             if data['stat'] == 'OK':
                 df = pd.DataFrame(data['data'], columns=data['fields'])
@@ -625,7 +622,7 @@ def check_signal_on_date(df, target_date_str, settings, strict_mode=True):
         if strategy != '蜻蜓點水 (縮量回測)':
             if pd.isna(curr['MA200']): return False, None, None
             bias = ((curr['Close'] - curr['MA200']) / curr['MA200']) * 100
-            if abs(bias) > settings['bias_range']: return False, None, None
+            if strategy != '浴火重生 (假跌破)' and abs(bias) > settings['bias_range']: return False, None, None
         
         is_signal = False
         if strategy == '籌碼衝鋒 (集中度高)':
@@ -634,8 +631,8 @@ def check_signal_on_date(df, target_date_str, settings, strict_mode=True):
             if (curr['Close'] > curr['MA200']) and (curr['Low'] <= curr['MA200'] * 1.03) and (curr['Volume'] < curr['Volume_MA5']): is_signal = True
         elif strategy == '浴火重生 (假跌破)':
             if curr['Close'] > curr['MA200']:
-                past_7 = df_sorted.iloc[target_loc - 8 : target_loc] 
-                is_break = (past_7['Low'] < past_7['MA200']).any()
+                past_10 = df_sorted.iloc[target_loc - 11 : target_loc] 
+                is_break = (past_10['Low'] < past_10['MA200']).any()
                 if is_break: is_signal = True
         if is_signal: return True, round(bias, 2), target_loc
         else: return False, None, None
@@ -766,7 +763,7 @@ try:
 
             bar = st.progress(0.0)
             status_text = st.empty() 
-            live_result_placeholder = st.empty() # ★ 修正：使用 placeholder
+            live_result_placeholder = st.empty() # ★ 修正：使用 placeholder 更新，避免重複顯示
             
             scanned_count = 0
             download_ok = 0
@@ -778,20 +775,16 @@ try:
                 bar.progress(prog)
                 status_text.text(f"🔥 掃描中... {ticker} | 下載OK: {download_ok} | 量能OK: {vol_ok} | 命中: {len(results)}")
                 
-                # 1. 極速優化：先抓原始資料
                 df = fetch_raw_data(ticker, period="1y") 
                 if df is None: continue
                 download_ok += 1
                 
-                # 2. 極速優化：秒刪量縮股
                 if df['Volume'].iloc[-1] < (min_vol * 1000): continue
                 vol_ok += 1
 
-                # 3. 極速優化：量夠才算指標
                 df = add_technical_indicators(df)
                 if df is None: continue
 
-                # 4. 策略檢查
                 match_result = check_stock_strategy_web(df, settings, ticker, chip_map)
                 
                 if debug_stock and debug_stock in ticker:
@@ -799,14 +792,12 @@ try:
 
                 if match_result:
                     code = ticker.split('.')[0]
-                    # 5. 避雷針檢查
                     if exclude_margin_surge:
                         m_change = margin_map.get(code, 0)
                         if m_change > 500:
                              if debug_stock and debug_stock in ticker: st.write(f"❌ 融資爆增 ({m_change}張) -> 剔除")
                              continue
                     
-                    # 6. 營收檢查 (預設 -100 不過濾)
                     rev_data = rev_map.get(code, {'yoy': 0, 'mom': 0})
                     if rev_data['yoy'] < min_revenue_yoy:
                         if debug_stock and debug_stock in ticker: st.write(f"❌ 營收成長不足 ({rev_data['yoy']}%) -> 剔除")
@@ -843,7 +834,6 @@ try:
                     })
                     
                     live_df = pd.DataFrame(results).sort_values(by="RSI", ascending=False)
-                    # ★ 修正：使用 placeholder 更新
                     live_result_placeholder.dataframe(
                         live_df,
                         column_config={
