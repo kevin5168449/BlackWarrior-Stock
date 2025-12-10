@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from FinMind.data import DataLoader
+
+# ★★★ 確認：已完全移除 FinMind 引用 ★★★
 
 # ==========================================
 # 0. 系統設定與 SSL 修正
@@ -22,10 +23,14 @@ try:
     st.set_page_config(page_title="黑武士・全能戰情室", layout="wide", page_icon="⚔️")
 except: pass
 
-# ★★★ 關鍵修正：忽略 SSL 警告，解決證交所連線錯誤 ★★★
+# 忽略 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HISTORY_FILE = "screening_history.csv"
+CACHE_DIR = "stock_cache"
+
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
 
 # 白名單
 VALID_STRATEGIES = [
@@ -85,7 +90,7 @@ def save_to_history(new_results):
         df_combined = df_new
     
     df_combined.to_csv(HISTORY_FILE, index=False, encoding='utf-8-sig')
-    st.toast(f"✅ 紀錄已儲存 (含營收與籌碼)")
+    st.toast(f"✅ 紀錄已儲存")
 
 def load_history():
     if os.path.exists(HISTORY_FILE): 
@@ -174,13 +179,37 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+# 抓取原始數據 (含快取)
 def fetch_raw_data(ticker, period="1y"):
     ticker = ticker.strip().upper()
     if not (ticker.endswith(".TW") or ticker.endswith(".TWO")): ticker = f"{ticker}.TW"
+    
+    cache_path = os.path.join(CACHE_DIR, f"{ticker}.csv")
+    
     try:
+        # 嘗試讀取快取
+        if os.path.exists(cache_path):
+            df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            if not df_old.empty:
+                last_date = df_old.index[-1].date()
+                today = get_taiwan_time().date()
+                if last_date < today:
+                    start_date = last_date + timedelta(days=1)
+                    if start_date <= today:
+                        df_new = yf.Ticker(ticker).history(start=start_date)
+                        if not df_new.empty:
+                            df_new.index = df_new.index.tz_localize(None)
+                            df_final = pd.concat([df_old, df_new])
+                            df_final = df_final[~df_final.index.duplicated(keep='last')]
+                            df_final.to_csv(cache_path)
+                            return df_final
+                return df_old
+        
+        # 無快取則下載
         data = yf.Ticker(ticker).history(period=period)
         if len(data) > 20: 
             data.index = data.index.tz_localize(None)
+            data.to_csv(cache_path)
             return data
     except: pass
     return None
@@ -197,7 +226,6 @@ def add_technical_indicators(data_df):
         return data_df
     except: return None
 
-# ★ 補回 fetch_stock_data
 def fetch_stock_data(ticker, period="5y"):
     df = fetch_raw_data(ticker, period)
     if df is not None:
@@ -215,7 +243,7 @@ def get_stock_fundamentals_safe(ticker):
         return eps, pe, roe
     except: return None, None, None
 
-# --- 營收 (MOPS) - 已加 verify=False ---
+# --- 營收 (MOPS) ---
 @st.cache_data(ttl=3600)
 def get_revenue_data_snapshot():
     date_obj = get_taiwan_time()
@@ -236,8 +264,8 @@ def get_revenue_data_snapshot():
         has_data = False
         for url in urls:
             try:
-                # ★ verify=False 解決 SSL Error
-                res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
+                # 使用 requests
+                res = requests.get(url, headers=HEADERS, timeout=3, verify=False)
                 res.encoding = 'utf-8'
                 dfs = pd.read_html(res.text)
                 for df in dfs:
@@ -265,14 +293,13 @@ def get_revenue_data_snapshot():
         target_month = target_month.replace(day=1) - timedelta(days=1)
     return {}, "無資料 (連線逾時)"
 
-# --- 融資 (TWSE + TPEx) - 已加 verify=False ---
+# --- 融資 (TWSE + TPEx) ---
 @st.cache_data(ttl=3600)
 def get_tpex_margin_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
     date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
     url = f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={date_str}&s=0,asc,0"
     try:
-        # ★ verify=False
         res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
         data = res.json()
         if 'aaData' in data:
@@ -301,7 +328,6 @@ def get_margin_data_snapshot():
         twse_dict = {}
         try:
             url = f"https://www.twse.com.tw/rwd/zh/margin/MI_MARGN?date={date_str}&selectType=STOCK&response=json"
-            # ★ verify=False
             res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
             data = res.json()
             if data['stat'] == 'OK':
@@ -323,14 +349,13 @@ def get_margin_data_snapshot():
         date_obj -= timedelta(days=1)
     return {}
 
-# --- 籌碼 (TWSE + TPEx) - 已加 verify=False ---
+# --- 籌碼 (TWSE + TPEx) ---
 @st.cache_data(ttl=3600)
 def get_tpex_chip_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
     date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
     url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=EW&t=D&d={date_str}"
     try:
-        # ★ verify=False
         res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
         data = res.json()
         if 'aaData' in data:
@@ -357,7 +382,6 @@ def get_chip_data_snapshot():
         twse_dict = {}
         try:
             url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_str_twse}&selectType=ALL&response=json"
-            # ★ verify=False
             res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
             data = res.json()
             if data['stat'] == 'OK':
@@ -390,7 +414,6 @@ def get_tw_market_heatmap_data():
         date_str = date_obj.strftime('%Y%m%d')
         url = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date_str}&type=ALLBUT0999&response=json"
         try:
-            # ★ verify=False
             res = requests.get(url, headers=HEADERS, timeout=15, verify=False)
             data = res.json()
             if data['stat'] == 'OK':
@@ -451,7 +474,6 @@ def get_all_market_news():
 def get_twse_sector_flow_dynamic():
     url_base = "https://www.twse.com.tw/rwd/zh/afterTrading/BFIAMU?response=json"
     try:
-        # ★ verify=False
         res = requests.get(url_base, headers=HEADERS, timeout=10, verify=False)
         data = res.json()
         if data.get('stat') != 'OK': return None, "無資料", None, None
@@ -486,7 +508,6 @@ def get_twse_sector_flow_dynamic():
 def get_institutional_ranking_smart():
     url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
     try:
-        # ★ verify=False
         res = requests.get(url, headers=HEADERS, timeout=10, verify=False)
         data = res.json()
         if data.get('stat') != 'OK': return None, "無資料"
@@ -840,6 +861,7 @@ try:
                     })
                     
                     live_df = pd.DataFrame(results).sort_values(by="RSI", ascending=False)
+                    # ★ 修正：使用 placeholder 更新
                     live_result_placeholder.dataframe(
                         live_df,
                         column_config={
