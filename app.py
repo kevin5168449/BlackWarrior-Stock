@@ -5,10 +5,10 @@ import numpy as np
 import time
 import twstock
 import os
-import shutil
 import requests
 import feedparser
 import urllib3
+import shutil
 from collections import Counter
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -22,15 +22,13 @@ try:
     st.set_page_config(page_title="黑武士・全能戰情室", layout="wide", page_icon="⚔️")
 except: pass
 
+# 忽略 SSL 警告 (解決爬蟲報錯)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 HISTORY_FILE = "screening_history.csv"
 CACHE_DIR = "stock_cache"
 
-# ★ 強制清除舊快取，避免讀到資料不足的檔案
-if os.path.exists(CACHE_DIR):
-    try:
-        shutil.rmtree(CACHE_DIR)
-    except: pass
+# 確保快取目錄存在
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
@@ -41,8 +39,12 @@ VALID_STRATEGIES = [
     "浴火重生 (假跌破)"
 ]
 
+# 偽裝瀏覽器 Headers
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Connection': 'keep-alive'
 }
 
 # ==========================================
@@ -180,20 +182,56 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ★★★ 關鍵修正：period="2y" 確保 MA200 算得出來 ★★★
+# ★★★ 核心修正：增量快取機制 (Smart Cache) ★★★
 def fetch_raw_data(ticker, period="2y"):
     ticker = ticker.strip().upper()
     if not (ticker.endswith(".TW") or ticker.endswith(".TWO")): ticker = f"{ticker}.TW"
     
     cache_path = os.path.join(CACHE_DIR, f"{ticker}.csv")
+    today = get_taiwan_time().date()
     
     try:
-        # 暫時不使用增量快取，避免資料長度不足的問題
-        # 直接下載新的 2 年資料
+        # 1. 嘗試讀取本地快取
+        if os.path.exists(cache_path):
+            try:
+                df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+                if not df_old.empty:
+                    last_date = df_old.index[-1].date()
+                    
+                    # 若資料已經是今天或昨天，直接使用
+                    if last_date >= today - timedelta(days=1):
+                         return df_old
+
+                    # 若資料舊了，嘗試下載缺漏的部分 (增量更新)
+                    if last_date < today:
+                        start_date = last_date + timedelta(days=1)
+                        if start_date <= today:
+                            # 這裡只下載從上次之後的資料
+                            df_new = yf.Ticker(ticker).history(start=start_date)
+                            
+                            if not df_new.empty:
+                                df_new.index = df_new.index.tz_localize(None)
+                                # 合併
+                                df_final = pd.concat([df_old, df_new])
+                                # 去重
+                                df_final = df_final[~df_final.index.duplicated(keep='last')]
+                                # 存回快取
+                                df_final.to_csv(cache_path)
+                                return df_final
+                            else:
+                                # 下載失敗或無新資料，回傳舊的
+                                return df_old
+            except: 
+                pass # 讀檔失敗，轉為重新下載
+
+        # 2. 無快取或讀檔失敗，執行完整下載
         data = yf.Ticker(ticker).history(period=period)
-        if len(data) > 60: 
-            data.index = data.index.tz_localize(None)
-            # data.to_csv(cache_path) # 暫時不寫入快取，確保每次都最新
+        if len(data) > 20: 
+            # 修正時區
+            if data.index.tz is not None:
+                data.index = data.index.tz_localize(None)
+            # 寫入快取
+            data.to_csv(cache_path)
             return data
     except: pass
     return None
@@ -210,21 +248,29 @@ def add_technical_indicators(data_df):
         return data_df
     except: return None
 
+# 回測系統專用接口
 def fetch_stock_data(ticker, period="5y"):
+    # 這裡直接呼叫 fetch_raw_data 利用快取機制，雖然 period 參數可能不同
+    # 但快取機制會自動補齊或重抓，確保資料正確
     df = fetch_raw_data(ticker, period)
     if df is not None:
         return add_technical_indicators(df)
     return None
 
+# ★★★ 修正：PE/EPS 抓取失敗回傳 N/A，不剔除股票 ★★★
 def get_stock_fundamentals_safe(ticker):
     try:
         if not ticker.endswith('.TW') and not ticker.endswith('.TWO'): ticker += '.TW'
         stock = yf.Ticker(ticker)
-        info = stock.info
-        eps = info.get('trailingEps', None)
-        pe = info.get('trailingPE', None)
-        roe = info.get('returnOnEquity', None)
-        return eps, pe, roe
+        try:
+            # 這裡不強求一定要抓到，因為 yfinance info 真的很常 timeout
+            info = stock.info
+            eps = info.get('trailingEps', None)
+            pe = info.get('trailingPE', None)
+            roe = info.get('returnOnEquity', None)
+            return eps, pe, roe
+        except:
+            return None, None, None
     except: return None, None, None
 
 # --- 營收 (MOPS) ---
@@ -274,9 +320,9 @@ def get_revenue_data_snapshot():
             except: pass
         if has_data: return revenue_map, f"{roc_year}/{month}"
         target_month = target_month.replace(day=1) - timedelta(days=1)
-    return {}, "無資料 (連線逾時)"
+    return {}, "無資料(逾時)"
 
-# --- 融資 ---
+# --- 融資 (TWSE + TPEx) ---
 @st.cache_data(ttl=3600)
 def get_tpex_margin_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
@@ -290,6 +336,7 @@ def get_tpex_margin_data_snapshot(date_obj):
             for row in data['aaData']:
                 try:
                     code = row[0]
+                    # TPEx 格式固定: [0]=代號, [6]=今日(張), [2]=前日(張)
                     today_bal = int(row[6].replace(',', ''))
                     yest_bal = int(row[2].replace(',', ''))
                     net_change = (today_bal - yest_bal) / 1000 
@@ -332,12 +379,13 @@ def get_margin_data_snapshot():
         date_obj -= timedelta(days=1)
     return {}
 
-# --- 籌碼 ---
+# --- 籌碼 (TWSE + TPEx) ---
 @st.cache_data(ttl=3600)
 def get_tpex_chip_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
     date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
-    url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=EW&t=D&d={date_str}"
+    # ★★★ 修正：se=AL 抓取所有股票 (含上櫃) ★★★
+    url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D&d={date_str}"
     try:
         res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
         data = res.json()
@@ -346,6 +394,8 @@ def get_tpex_chip_data_snapshot(date_obj):
             for row in data['aaData']:
                 code = row[0]
                 try:
+                    # TPEx 三大法人買賣超通常在最後一欄 (或倒數幾欄)
+                    # 這裡嘗試抓取最後一個非空的數字欄位
                     net_buy = int(row[-1].replace(',', '')) 
                     chip_dict[code] = net_buy
                 except: continue
@@ -697,6 +747,13 @@ try:
     st.sidebar.header("🔧 系統診斷 / 通知")
     line_token = st.sidebar.text_input("🔔 Line Notify Token (選填)", type="password")
 
+    if st.sidebar.button("🗑️ 清除快取 (強制重抓)"):
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+            os.makedirs(CACHE_DIR)
+        st.sidebar.success("快取已清空！")
+
     if st.sidebar.button("🛠️ 測試連線"):
         with st.sidebar.status("測試中..."):
             try:
@@ -810,14 +867,12 @@ try:
 
                 if match_result:
                     code = ticker.split('.')[0]
-                    # 5. 避雷針檢查
                     if exclude_margin_surge:
                         m_change = margin_map.get(code, 0)
                         if m_change > 500:
                              if debug_stock and debug_stock in ticker: st.write(f"❌ 融資爆增 ({m_change}張) -> 剔除")
                              continue
                     
-                    # 6. 營收檢查 (預設 -100 不過濾)
                     rev_data = rev_map.get(code, {'yoy': 0, 'mom': 0})
                     if rev_data['yoy'] < min_revenue_yoy:
                         if debug_stock and debug_stock in ticker: st.write(f"❌ 營收成長不足 ({rev_data['yoy']}%) -> 剔除")
@@ -826,7 +881,8 @@ try:
                     eps, pe, _ = get_stock_fundamentals_safe(ticker)
                     
                     if exclude_negative_pe:
-                        if (eps is not None and eps < 0) or (pe is None):
+                        # 只有當 N/A 時不剔除，只有明確 < 0 才剔除
+                        if eps is not None and eps < 0:
                              if debug_stock and debug_stock in ticker: st.write(f"❌ 虧損股 (EPS {eps}) -> 剔除")
                              continue
                     
