@@ -1,4 +1,4 @@
-%%writefile app.py
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -1117,4 +1117,5 @@ try:
                 else: st.warning("無模擬結果")
 
 except Exception as e:
+
     st.error(f"發生錯誤: {e}")
