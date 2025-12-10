@@ -1,4 +1,3 @@
-%%writefile app.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -1155,3 +1154,4 @@ try:
 
 except Exception as e:
     st.error(f"發生錯誤: {e}")
+
