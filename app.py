@@ -7,13 +7,12 @@ import twstock
 import os
 import requests
 import feedparser
+import shutil
 from collections import Counter
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-
-# ★★★ 修正：已移除 FinMind 引用，現在是純爬蟲模式 ★★★
 
 # ==========================================
 # 0. 系統設定
@@ -23,6 +22,10 @@ try:
 except: pass
 
 HISTORY_FILE = "screening_history.csv"
+CACHE_DIR = "stock_cache"
+
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
 
 # 白名單
 VALID_STRATEGIES = [
@@ -30,6 +33,11 @@ VALID_STRATEGIES = [
     "蜻蜓點水 (縮量回測)", 
     "浴火重生 (假跌破)"
 ]
+
+# 偽裝瀏覽器 Headers
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
 
 # ==========================================
 # 1. 檔案與清洗 / 工具函式
@@ -93,7 +101,7 @@ def clear_history():
 clean_invalid_data()
 
 # ==========================================
-# 2. 數據獲取 (核心函數 - 優先加載)
+# 2. 數據獲取
 # ==========================================
 
 @st.cache_data(ttl=86400)
@@ -166,17 +174,42 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+# 抓取原始數據 (含快取)
 def fetch_raw_data(ticker, period="1y"):
     ticker = ticker.strip().upper()
     if not (ticker.endswith(".TW") or ticker.endswith(".TWO")): ticker = f"{ticker}.TW"
+    
+    cache_path = os.path.join(CACHE_DIR, f"{ticker}.csv")
+    
     try:
+        # 嘗試讀取快取
+        if os.path.exists(cache_path):
+            df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            if not df_old.empty:
+                last_date = df_old.index[-1].date()
+                today = get_taiwan_time().date()
+                if last_date < today:
+                    start_date = last_date + timedelta(days=1)
+                    if start_date <= today:
+                        df_new = yf.Ticker(ticker).history(start=start_date)
+                        if not df_new.empty:
+                            df_new.index = df_new.index.tz_localize(None)
+                            df_final = pd.concat([df_old, df_new])
+                            df_final = df_final[~df_final.index.duplicated(keep='last')]
+                            df_final.to_csv(cache_path)
+                            return df_final
+                return df_old
+        
+        # 無快取則下載
         data = yf.Ticker(ticker).history(period=period)
         if len(data) > 20: 
             data.index = data.index.tz_localize(None)
+            data.to_csv(cache_path)
             return data
     except: pass
     return None
 
+# 計算指標
 def add_technical_indicators(data_df):
     try:
         data_df['MA5'] = data_df['Close'].rolling(window=5).mean()
@@ -189,6 +222,14 @@ def add_technical_indicators(data_df):
         return data_df
     except: return None
 
+# ★★★ 關鍵修復：補回 fetch_stock_data 供 Tab 4/8 使用 ★★★
+def fetch_stock_data(ticker, period="5y"):
+    df = fetch_raw_data(ticker, period)
+    if df is not None:
+        return add_technical_indicators(df)
+    return None
+
+# 基本面
 def get_stock_fundamentals_safe(ticker):
     try:
         if not ticker.endswith('.TW') and not ticker.endswith('.TWO'): ticker += '.TW'
@@ -199,11 +240,6 @@ def get_stock_fundamentals_safe(ticker):
         roe = info.get('returnOnEquity', None)
         return eps, pe, roe
     except: return None, None, None
-
-# ★★★ 關鍵修正：加入偽裝 Headers ★★★
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
 
 # --- 營收 (MOPS) ---
 @st.cache_data(ttl=3600)
@@ -226,7 +262,6 @@ def get_revenue_data_snapshot():
         has_data = False
         for url in urls:
             try:
-                # ★ 加入 Headers + verify=False
                 res = requests.get(url, headers=HEADERS, timeout=3, verify=False)
                 res.encoding = 'utf-8'
                 dfs = pd.read_html(res.text)
@@ -253,9 +288,9 @@ def get_revenue_data_snapshot():
             except: pass
         if has_data: return revenue_map, f"{roc_year}/{month}"
         target_month = target_month.replace(day=1) - timedelta(days=1)
-    return {}, "無資料 (連線逾時)"
+    return {}, "無資料"
 
-# --- 融資 (TWSE + TPEx) ---
+# --- 融資 ---
 @st.cache_data(ttl=3600)
 def get_tpex_margin_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
@@ -311,7 +346,7 @@ def get_margin_data_snapshot():
         date_obj -= timedelta(days=1)
     return {}
 
-# --- 籌碼 (TWSE + TPEx) ---
+# --- 籌碼 ---
 @st.cache_data(ttl=3600)
 def get_tpex_chip_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
@@ -676,25 +711,12 @@ try:
     st.sidebar.header("🔧 系統診斷 / 通知")
     line_token = st.sidebar.text_input("🔔 Line Notify Token (選填)", type="password")
 
-    if st.sidebar.button("🛠️ 測試連線"):
-        with st.sidebar.status("測試中..."):
-            try:
-                test_df = yf.Ticker("2330.TW").history(period="5d")
-                if not test_df.empty: st.write("✅ yfinance OK")
-                else: st.error("❌ yfinance Error")
-                
-                rev_map, rev_date = get_revenue_data_snapshot()
-                if rev_map: st.write(f"✅ 營收數據 OK ({rev_date})")
-                else: st.warning("⚠️ 營收無資料")
-                
-                chip_map, d = get_chip_data_snapshot()
-                if chip_map: st.write(f"✅ 籌碼 OK ({d})")
-                else: st.warning("⚠️ 籌碼無資料")
-                
-                margin_map = get_margin_data_snapshot()
-                if margin_map: st.write(f"✅ 融資 OK")
-                else: st.warning("⚠️ 融資無資料")
-            except Exception as e: st.error(f"Error: {e}")
+    if st.sidebar.button("🗑️ 清除快取 (強制重抓)"):
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+            os.makedirs(CACHE_DIR)
+        st.sidebar.success("快取已清空！")
 
     st.sidebar.header("⚔️ 招式選擇")
     strategy_mode = st.sidebar.selectbox("選擇策略：", VALID_STRATEGIES, index=0)
@@ -760,7 +782,7 @@ try:
 
             bar = st.progress(0.0)
             status_text = st.empty() 
-            live_result_placeholder = st.empty() # ★ 修正：使用 placeholder 更新，避免重複顯示
+            live_result_placeholder = st.empty()
             
             scanned_count = 0
             download_ok = 0
@@ -833,7 +855,6 @@ try:
                     })
                     
                     live_df = pd.DataFrame(results).sort_values(by="RSI", ascending=False)
-                    # ★ 修正：使用 placeholder 更新
                     live_result_placeholder.dataframe(
                         live_df,
                         column_config={
