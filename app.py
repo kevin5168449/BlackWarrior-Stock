@@ -1,4 +1,3 @@
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -6,6 +5,7 @@ import numpy as np
 import time
 import twstock
 import os
+import shutil
 import requests
 import feedparser
 from collections import Counter
@@ -23,7 +23,13 @@ try:
 except: pass
 
 HISTORY_FILE = "screening_history.csv"
+CACHE_DIR = "stock_cache" # 股價快取資料夾
 
+# 確保快取目錄存在
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+
+# 白名單
 VALID_STRATEGIES = [
     "籌碼衝鋒 (集中度高)", 
     "蜻蜓點水 (縮量回測)", 
@@ -42,7 +48,7 @@ def send_line_notify(token, message):
     headers = {"Authorization": f"Bearer {token}"}
     data = {"message": message}
     try:
-        requests.post(url, headers=headers, data=data)
+        requests.post(url, headers=headers, data=data, timeout=5)
     except: pass
 
 def clean_invalid_data():
@@ -165,19 +171,54 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# 抓取原始數據 (極速版)
+# ★★★ 關鍵更新：智慧增量下載 (Cache + Incremental Update) ★★★
 def fetch_raw_data(ticker, period="1y"):
     ticker = ticker.strip().upper()
     if not (ticker.endswith(".TW") or ticker.endswith(".TWO")): ticker = f"{ticker}.TW"
+    
+    # 定義快取檔案路徑
+    cache_path = os.path.join(CACHE_DIR, f"{ticker}.csv")
+    
     try:
+        # 1. 嘗試讀取本地快取
+        if os.path.exists(cache_path):
+            df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            if not df_old.empty:
+                last_date = df_old.index[-1].date()
+                today = get_taiwan_time().date()
+                
+                # 如果快取日期小於今天，嘗試抓取新資料 (增量更新)
+                if last_date < today:
+                    start_date = last_date + timedelta(days=1)
+                    # 避免抓取未來日期報錯
+                    if start_date <= today:
+                        # 只下載缺漏的部分
+                        df_new = yf.Ticker(ticker).history(start=start_date)
+                        if not df_new.empty:
+                            df_new.index = df_new.index.tz_localize(None)
+                            # 合併並去重
+                            df_final = pd.concat([df_old, df_new])
+                            df_final = df_final[~df_final.index.duplicated(keep='last')]
+                            # 更新快取檔案
+                            df_final.to_csv(cache_path)
+                            return df_final
+                
+                # 如果日期已是最新，直接回傳快取
+                return df_old
+
+        # 2. 無快取或讀取失敗，執行完整下載
         data = yf.Ticker(ticker).history(period=period)
         if len(data) > 20: 
             data.index = data.index.tz_localize(None)
+            # 寫入快取
+            data.to_csv(cache_path)
             return data
-    except: pass
+            
+    except Exception:
+        pass
+        
     return None
 
-# 計算指標 (極速版)
 def add_technical_indicators(data_df):
     try:
         data_df['MA5'] = data_df['Close'].rolling(window=5).mean()
@@ -190,7 +231,6 @@ def add_technical_indicators(data_df):
         return data_df
     except: return None
 
-# 基本面 (EPS/PE/ROE)
 def get_stock_fundamentals_safe(ticker):
     try:
         if not ticker.endswith('.TW') and not ticker.endswith('.TWO'): ticker += '.TW'
@@ -206,14 +246,13 @@ def get_stock_fundamentals_safe(ticker):
 @st.cache_data(ttl=3600)
 def get_revenue_data_snapshot():
     date_obj = get_taiwan_time()
-    # 判斷是否為月初 (12號前可能尚未公佈上月營收)
     if date_obj.day < 12: 
         target_month = date_obj.replace(day=1) - timedelta(days=1)
         target_month = target_month.replace(day=1) - timedelta(days=1)
     else:
         target_month = date_obj.replace(day=1) - timedelta(days=1)
         
-    for _ in range(2): # 試兩次 (上月, 上上月)
+    for _ in range(2): 
         roc_year = target_month.year - 1911
         month = target_month.month
         revenue_map = {}
@@ -225,7 +264,7 @@ def get_revenue_data_snapshot():
         for url in urls:
             try:
                 headers = {'User-Agent': 'Mozilla/5.0'}
-                res = requests.get(url, headers=headers, timeout=10) # 設置 timeout 防止卡住
+                res = requests.get(url, headers=headers, timeout=3, verify=False)
                 res.encoding = 'utf-8'
                 dfs = pd.read_html(res.text)
                 for df in dfs:
@@ -260,7 +299,7 @@ def get_tpex_margin_data_snapshot(date_obj):
     date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
     url = f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={date_str}&s=0,asc,0"
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, timeout=5)
         data = res.json()
         if 'aaData' in data:
             margin_dict = {}
@@ -288,7 +327,7 @@ def get_margin_data_snapshot():
         twse_dict = {}
         try:
             url = f"https://www.twse.com.tw/rwd/zh/margin/MI_MARGN?date={date_str}&selectType=STOCK&response=json"
-            res = requests.get(url, timeout=10)
+            res = requests.get(url, timeout=5)
             data = res.json()
             if data['stat'] == 'OK':
                 for table in data.get('tables', []):
@@ -316,7 +355,7 @@ def get_tpex_chip_data_snapshot(date_obj):
     date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
     url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=EW&t=D&d={date_str}"
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, timeout=5)
         data = res.json()
         if 'aaData' in data:
             chip_dict = {}
@@ -342,7 +381,7 @@ def get_chip_data_snapshot():
         twse_dict = {}
         try:
             url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_str_twse}&selectType=ALL&response=json"
-            res = requests.get(url, timeout=10)
+            res = requests.get(url, timeout=5)
             data = res.json()
             if data['stat'] == 'OK':
                 df = pd.DataFrame(data['data'], columns=data['fields'])
@@ -395,7 +434,11 @@ def get_tw_market_heatmap_data():
                     df.loc[mask, '漲跌幅%'] = (df.loc[mask, '漲跌金額'] / df.loc[mask, '昨日收盤']) * 100
                     df['漲跌幅%'] = df['漲跌幅%'].round(2)
                     df_top = df.sort_values('成交金額', ascending=False).head(400).copy() 
-                    df_top['產業'] = df_top['證券代號'].apply(get_stock_sector)
+                    def get_sector_enhanced(code):
+                        if code in SUB_SECTOR_MAP: return SUB_SECTOR_MAP[code]
+                        try: return twstock.codes[code].group
+                        except: return "其他"
+                    df_top['產業'] = df_top['證券代號'].apply(get_sector_enhanced)
                     df_top['標籤'] = df_top['證券名稱'] + "<br>" + df_top['漲跌幅%'].astype(str) + "%"
                     return df_top, date_str
         except: pass
@@ -539,6 +582,7 @@ def check_stock_strategy_web(df, settings, ticker="", chip_map=None):
     if settings['check_red_candle']:
         if not is_bullish_candlestick(curr['Open'], curr['Close'], curr['High'], curr['Low']): return False
 
+    # 策略邏輯
     if strategy == '籌碼衝鋒 (集中度高)':
         if curr['Close'] <= curr['MA20']: return False
         chip_status = "⚠️ 無籌碼數據"
@@ -669,25 +713,12 @@ try:
     st.sidebar.header("🔧 系統診斷 / 通知")
     line_token = st.sidebar.text_input("🔔 Line Notify Token (選填)", type="password")
 
-    if st.sidebar.button("🛠️ 測試連線"):
-        with st.sidebar.status("測試中..."):
-            try:
-                test_df = yf.Ticker("2330.TW").history(period="5d")
-                if not test_df.empty: st.write("✅ yfinance OK")
-                else: st.error("❌ yfinance Error")
-                
-                rev_map, rev_date = get_revenue_data_snapshot()
-                if rev_map: st.write(f"✅ 營收數據 OK ({rev_date})")
-                else: st.warning("⚠️ 營收無資料")
-                
-                chip_map, d = get_chip_data_snapshot()
-                if chip_map: st.write(f"✅ 籌碼 OK ({d})")
-                else: st.warning("⚠️ 籌碼無資料")
-                
-                margin_map = get_margin_data_snapshot()
-                if margin_map: st.write(f"✅ 融資 OK")
-                else: st.warning("⚠️ 融資無資料")
-            except Exception as e: st.error(f"Error: {e}")
+    if st.sidebar.button("🗑️ 清除快取 (強制重抓)"):
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+            os.makedirs(CACHE_DIR)
+        st.sidebar.success("快取已清空，下次將重新下載！")
 
     st.sidebar.header("⚔️ 招式選擇")
     strategy_mode = st.sidebar.selectbox("選擇策略：", VALID_STRATEGIES, index=0)
@@ -789,7 +820,7 @@ try:
                              if debug_stock and debug_stock in ticker: st.write(f"❌ 融資爆增 ({m_change}張) -> 剔除")
                              continue
                     
-                    # 6. 營收檢查
+                    # 6. 營收檢查 (預設 -100 不過濾)
                     rev_data = rev_map.get(code, {'yoy': 0, 'mom': 0})
                     if rev_data['yoy'] < min_revenue_yoy:
                         if debug_stock and debug_stock in ticker: st.write(f"❌ 營收成長不足 ({rev_data['yoy']}%) -> 剔除")
@@ -1117,5 +1148,4 @@ try:
                 else: st.warning("無模擬結果")
 
 except Exception as e:
-
     st.error(f"發生錯誤: {e}")
