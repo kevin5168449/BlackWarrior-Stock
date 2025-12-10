@@ -22,7 +22,7 @@ try:
     st.set_page_config(page_title="黑武士・全能戰情室", layout="wide", page_icon="⚔️")
 except: pass
 
-# 忽略 SSL 警告 (解決爬蟲報錯)
+# 忽略 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HISTORY_FILE = "screening_history.csv"
@@ -182,58 +182,54 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ★★★ 核心修正：增量快取機制 (Smart Cache) ★★★
+# ★★★ 核心修正：雙重嘗試 (Double Try) 下載機制 ★★★
 def fetch_raw_data(ticker, period="2y"):
-    ticker = ticker.strip().upper()
-    if not (ticker.endswith(".TW") or ticker.endswith(".TWO")): ticker = f"{ticker}.TW"
+    clean_ticker = ticker.replace(".TW", "").replace(".TWO", "").strip().upper()
     
-    cache_path = os.path.join(CACHE_DIR, f"{ticker}.csv")
-    today = get_taiwan_time().date()
+    # 預設嘗試順序：如果原本有 .TWO 就優先試 .TWO，否則優先 .TW
+    if ".TWO" in ticker:
+        targets = [f"{clean_ticker}.TWO", f"{clean_ticker}.TW"]
+    else:
+        targets = [f"{clean_ticker}.TW", f"{clean_ticker}.TWO"]
     
-    try:
-        # 1. 嘗試讀取本地快取
-        if os.path.exists(cache_path):
-            try:
-                df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-                if not df_old.empty:
-                    last_date = df_old.index[-1].date()
-                    
-                    # 若資料已經是今天或昨天，直接使用
-                    if last_date >= today - timedelta(days=1):
-                         return df_old
+    for t in targets:
+        cache_path = os.path.join(CACHE_DIR, f"{t}.csv")
+        today = get_taiwan_time().date()
+        
+        try:
+            # 1. 嘗試讀取快取
+            if os.path.exists(cache_path):
+                try:
+                    df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+                    if not df_old.empty:
+                        last_date = df_old.index[-1].date()
+                        if last_date >= today - timedelta(days=1):
+                             return df_old
 
-                    # 若資料舊了，嘗試下載缺漏的部分 (增量更新)
-                    if last_date < today:
-                        start_date = last_date + timedelta(days=1)
-                        if start_date <= today:
-                            # 這裡只下載從上次之後的資料
-                            df_new = yf.Ticker(ticker).history(start=start_date)
-                            
-                            if not df_new.empty:
-                                df_new.index = df_new.index.tz_localize(None)
-                                # 合併
-                                df_final = pd.concat([df_old, df_new])
-                                # 去重
-                                df_final = df_final[~df_final.index.duplicated(keep='last')]
-                                # 存回快取
-                                df_final.to_csv(cache_path)
-                                return df_final
-                            else:
-                                # 下載失敗或無新資料，回傳舊的
-                                return df_old
-            except: 
-                pass # 讀檔失敗，轉為重新下載
+                        if last_date < today:
+                            start_date = last_date + timedelta(days=1)
+                            if start_date <= today:
+                                df_new = yf.Ticker(t).history(start=start_date)
+                                if not df_new.empty:
+                                    df_new.index = df_new.index.tz_localize(None)
+                                    df_final = pd.concat([df_old, df_new])
+                                    df_final = df_final[~df_final.index.duplicated(keep='last')]
+                                    df_final.to_csv(cache_path)
+                                    return df_final
+                                else:
+                                    return df_old # 連線失敗回傳舊資料
+                except: pass
 
-        # 2. 無快取或讀檔失敗，執行完整下載
-        data = yf.Ticker(ticker).history(period=period)
-        if len(data) > 20: 
-            # 修正時區
-            if data.index.tz is not None:
-                data.index = data.index.tz_localize(None)
-            # 寫入快取
-            data.to_csv(cache_path)
-            return data
-    except: pass
+            # 2. 無快取，下載新資料
+            data = yf.Ticker(t).history(period=period)
+            if len(data) > 20: 
+                if data.index.tz is not None:
+                    data.index = data.index.tz_localize(None)
+                data.to_csv(cache_path)
+                return data
+                
+        except: pass
+        
     return None
 
 def add_technical_indicators(data_df):
@@ -248,23 +244,27 @@ def add_technical_indicators(data_df):
         return data_df
     except: return None
 
-# 回測系統專用接口
 def fetch_stock_data(ticker, period="5y"):
-    # 這裡直接呼叫 fetch_raw_data 利用快取機制，雖然 period 參數可能不同
-    # 但快取機制會自動補齊或重抓，確保資料正確
     df = fetch_raw_data(ticker, period)
     if df is not None:
         return add_technical_indicators(df)
     return None
 
-# ★★★ 修正：PE/EPS 抓取失敗回傳 N/A，不剔除股票 ★★★
 def get_stock_fundamentals_safe(ticker):
     try:
-        if not ticker.endswith('.TW') and not ticker.endswith('.TWO'): ticker += '.TW'
+        # 修正：基本面查詢也支援自動切換後輟
         stock = yf.Ticker(ticker)
         try:
-            # 這裡不強求一定要抓到，因為 yfinance info 真的很常 timeout
             info = stock.info
+            # 若第一種後輟抓不到，嘗試切換
+            if not info or 'trailingEps' not in info:
+                if ".TW" in ticker:
+                    stock = yf.Ticker(ticker.replace(".TW", ".TWO"))
+                    info = stock.info
+                elif ".TWO" in ticker:
+                    stock = yf.Ticker(ticker.replace(".TWO", ".TW"))
+                    info = stock.info
+            
             eps = info.get('trailingEps', None)
             pe = info.get('trailingPE', None)
             roe = info.get('returnOnEquity', None)
@@ -322,7 +322,7 @@ def get_revenue_data_snapshot():
         target_month = target_month.replace(day=1) - timedelta(days=1)
     return {}, "無資料(逾時)"
 
-# --- 融資 (TWSE + TPEx) ---
+# --- 融資 ---
 @st.cache_data(ttl=3600)
 def get_tpex_margin_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
@@ -336,7 +336,6 @@ def get_tpex_margin_data_snapshot(date_obj):
             for row in data['aaData']:
                 try:
                     code = row[0]
-                    # TPEx 格式固定: [0]=代號, [6]=今日(張), [2]=前日(張)
                     today_bal = int(row[6].replace(',', ''))
                     yest_bal = int(row[2].replace(',', ''))
                     net_change = (today_bal - yest_bal) / 1000 
@@ -379,12 +378,11 @@ def get_margin_data_snapshot():
         date_obj -= timedelta(days=1)
     return {}
 
-# --- 籌碼 (TWSE + TPEx) ---
+# --- 籌碼 ---
 @st.cache_data(ttl=3600)
 def get_tpex_chip_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
     date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
-    # ★★★ 修正：se=AL 抓取所有股票 (含上櫃) ★★★
     url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D&d={date_str}"
     try:
         res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
@@ -394,8 +392,6 @@ def get_tpex_chip_data_snapshot(date_obj):
             for row in data['aaData']:
                 code = row[0]
                 try:
-                    # TPEx 三大法人買賣超通常在最後一欄 (或倒數幾欄)
-                    # 這裡嘗試抓取最後一個非空的數字欄位
                     net_buy = int(row[-1].replace(',', '')) 
                     chip_dict[code] = net_buy
                 except: continue
@@ -881,7 +877,6 @@ try:
                     eps, pe, _ = get_stock_fundamentals_safe(ticker)
                     
                     if exclude_negative_pe:
-                        # 只有當 N/A 時不剔除，只有明確 < 0 才剔除
                         if eps is not None and eps < 0:
                              if debug_stock and debug_stock in ticker: st.write(f"❌ 虧損股 (EPS {eps}) -> 剔除")
                              continue
