@@ -14,10 +14,8 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 
-# ★★★ 確認：已完全移除 FinMind 引用 ★★★
-
 # ==========================================
-# 0. 系統設定與 SSL 修正
+# 0. 系統設定
 # ==========================================
 try:
     st.set_page_config(page_title="黑武士・全能戰情室", layout="wide", page_icon="⚔️")
@@ -106,7 +104,7 @@ def clear_history():
 clean_invalid_data()
 
 # ==========================================
-# 2. 數據獲取 (核心函數 - 優先加載)
+# 2. 數據獲取
 # ==========================================
 
 @st.cache_data(ttl=86400)
@@ -187,7 +185,6 @@ def fetch_raw_data(ticker, period="1y"):
     cache_path = os.path.join(CACHE_DIR, f"{ticker}.csv")
     
     try:
-        # 嘗試讀取快取
         if os.path.exists(cache_path):
             df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
             if not df_old.empty:
@@ -205,7 +202,6 @@ def fetch_raw_data(ticker, period="1y"):
                             return df_final
                 return df_old
         
-        # 無快取則下載
         data = yf.Ticker(ticker).history(period=period)
         if len(data) > 20: 
             data.index = data.index.tz_localize(None)
@@ -226,6 +222,7 @@ def add_technical_indicators(data_df):
         return data_df
     except: return None
 
+# ★★★ 關鍵修正：確保此函式在 check_stock_strategy_web 之前被定義 ★★★
 def fetch_stock_data(ticker, period="5y"):
     df = fetch_raw_data(ticker, period)
     if df is not None:
@@ -264,7 +261,6 @@ def get_revenue_data_snapshot():
         has_data = False
         for url in urls:
             try:
-                # 使用 requests
                 res = requests.get(url, headers=HEADERS, timeout=3, verify=False)
                 res.encoding = 'utf-8'
                 dfs = pd.read_html(res.text)
@@ -291,7 +287,7 @@ def get_revenue_data_snapshot():
             except: pass
         if has_data: return revenue_map, f"{roc_year}/{month}"
         target_month = target_month.replace(day=1) - timedelta(days=1)
-    return {}, "無資料 (連線逾時)"
+    return {}, "無資料"
 
 # --- 融資 (TWSE + TPEx) ---
 @st.cache_data(ttl=3600)
@@ -545,6 +541,17 @@ def get_institutional_ranking_smart():
 # ==========================================
 # 3. 核心策略
 # ==========================================
+
+# ★★★ 關鍵：將此函式移到被呼叫之前 ★★★
+def is_bullish_candlestick(open_p, close_p, high_p, low_p):
+    if close_p > open_p: return True
+    total_len = high_p - low_p
+    body_len = abs(close_p - open_p)
+    if total_len > 0 and (body_len / total_len < 0.1): return True
+    if open_p > 0 and (body_len / open_p < 0.003): return True
+    lower_shadow = min(open_p, close_p) - low_p
+    if total_len > 0 and (lower_shadow / total_len > 0.5): return True
+    return False
 
 def check_stock_strategy_web(df, settings, ticker="", chip_map=None):
     if df is None or len(df) < 60: return False
