@@ -5,6 +5,7 @@ import numpy as np
 import time
 import twstock
 import os
+import shutil
 import requests
 import feedparser
 import urllib3
@@ -21,12 +22,15 @@ try:
     st.set_page_config(page_title="黑武士・全能戰情室", layout="wide", page_icon="⚔️")
 except: pass
 
-# 忽略 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 HISTORY_FILE = "screening_history.csv"
 CACHE_DIR = "stock_cache"
 
+# ★ 強制清除舊快取，避免讀到資料不足的檔案
+if os.path.exists(CACHE_DIR):
+    try:
+        shutil.rmtree(CACHE_DIR)
+    except: pass
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
@@ -37,7 +41,6 @@ VALID_STRATEGIES = [
     "浴火重生 (假跌破)"
 ]
 
-# 偽裝瀏覽器 Headers
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
@@ -177,35 +180,20 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# 抓取原始數據 (含快取)
-def fetch_raw_data(ticker, period="1y"):
+# ★★★ 關鍵修正：period="2y" 確保 MA200 算得出來 ★★★
+def fetch_raw_data(ticker, period="2y"):
     ticker = ticker.strip().upper()
     if not (ticker.endswith(".TW") or ticker.endswith(".TWO")): ticker = f"{ticker}.TW"
     
     cache_path = os.path.join(CACHE_DIR, f"{ticker}.csv")
     
     try:
-        if os.path.exists(cache_path):
-            df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-            if not df_old.empty:
-                last_date = df_old.index[-1].date()
-                today = get_taiwan_time().date()
-                if last_date < today:
-                    start_date = last_date + timedelta(days=1)
-                    if start_date <= today:
-                        df_new = yf.Ticker(ticker).history(start=start_date)
-                        if not df_new.empty:
-                            df_new.index = df_new.index.tz_localize(None)
-                            df_final = pd.concat([df_old, df_new])
-                            df_final = df_final[~df_final.index.duplicated(keep='last')]
-                            df_final.to_csv(cache_path)
-                            return df_final
-                return df_old
-        
+        # 暫時不使用增量快取，避免資料長度不足的問題
+        # 直接下載新的 2 年資料
         data = yf.Ticker(ticker).history(period=period)
-        if len(data) > 20: 
+        if len(data) > 60: 
             data.index = data.index.tz_localize(None)
-            data.to_csv(cache_path)
+            # data.to_csv(cache_path) # 暫時不寫入快取，確保每次都最新
             return data
     except: pass
     return None
@@ -222,7 +210,6 @@ def add_technical_indicators(data_df):
         return data_df
     except: return None
 
-# ★★★ 關鍵修正：確保此函式在 check_stock_strategy_web 之前被定義 ★★★
 def fetch_stock_data(ticker, period="5y"):
     df = fetch_raw_data(ticker, period)
     if df is not None:
@@ -287,9 +274,9 @@ def get_revenue_data_snapshot():
             except: pass
         if has_data: return revenue_map, f"{roc_year}/{month}"
         target_month = target_month.replace(day=1) - timedelta(days=1)
-    return {}, "無資料"
+    return {}, "無資料 (連線逾時)"
 
-# --- 融資 (TWSE + TPEx) ---
+# --- 融資 ---
 @st.cache_data(ttl=3600)
 def get_tpex_margin_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
@@ -345,7 +332,7 @@ def get_margin_data_snapshot():
         date_obj -= timedelta(days=1)
     return {}
 
-# --- 籌碼 (TWSE + TPEx) ---
+# --- 籌碼 ---
 @st.cache_data(ttl=3600)
 def get_tpex_chip_data_snapshot(date_obj):
     roc_year = int(date_obj.strftime('%Y')) - 1911
@@ -542,7 +529,6 @@ def get_institutional_ranking_smart():
 # 3. 核心策略
 # ==========================================
 
-# ★★★ 關鍵：將此函式移到被呼叫之前 ★★★
 def is_bullish_candlestick(open_p, close_p, high_p, low_p):
     if close_p > open_p: return True
     total_len = high_p - low_p
@@ -807,7 +793,7 @@ try:
                 bar.progress(prog)
                 status_text.text(f"🔥 掃描中... {ticker} | 下載OK: {download_ok} | 量能OK: {vol_ok} | 命中: {len(results)}")
                 
-                df = fetch_raw_data(ticker, period="1y") 
+                df = fetch_raw_data(ticker, period="2y") 
                 if df is None: continue
                 download_ok += 1
                 
@@ -868,7 +854,6 @@ try:
                     })
                     
                     live_df = pd.DataFrame(results).sort_values(by="RSI", ascending=False)
-                    # ★ 修正：使用 placeholder 更新
                     live_result_placeholder.dataframe(
                         live_df,
                         column_config={
