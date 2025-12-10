@@ -1,3 +1,4 @@
+%%writefile app.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -8,7 +9,6 @@ import os
 import requests
 import feedparser
 import urllib3
-import shutil
 from collections import Counter
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -26,11 +26,6 @@ except: pass
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HISTORY_FILE = "screening_history.csv"
-CACHE_DIR = "stock_cache"
-
-# 確保快取目錄存在
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
 
 # 白名單
 VALID_STRATEGIES = [
@@ -43,7 +38,6 @@ VALID_STRATEGIES = [
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
     'Connection': 'keep-alive'
 }
 
@@ -182,54 +176,33 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ★★★ 核心修正：雙重嘗試 (Double Try) 下載機制 ★★★
-def fetch_raw_data(ticker, period="2y"):
-    clean_ticker = ticker.replace(".TW", "").replace(".TWO", "").strip().upper()
+# ★★★ 修正：移除快取，改為直接下載 + 智慧後綴切換 ★★★
+def fetch_raw_data(ticker, period="1y"):
+    # 1. 嘗試原始代號
+    try:
+        data = yf.Ticker(ticker).history(period=period)
+        if not data.empty and len(data) > 20:
+            if data.index.tz is not None:
+                data.index = data.index.tz_localize(None)
+            return data
+    except: pass
     
-    # 預設嘗試順序：如果原本有 .TWO 就優先試 .TWO，否則優先 .TW
-    if ".TWO" in ticker:
-        targets = [f"{clean_ticker}.TWO", f"{clean_ticker}.TW"]
-    else:
-        targets = [f"{clean_ticker}.TW", f"{clean_ticker}.TWO"]
+    # 2. 嘗試切換後綴 (TW <-> TWO)
+    try:
+        if ".TW" in ticker:
+            alt_ticker = ticker.replace(".TW", ".TWO")
+        elif ".TWO" in ticker:
+            alt_ticker = ticker.replace(".TWO", ".TW")
+        else:
+            return None
+            
+        data = yf.Ticker(alt_ticker).history(period=period)
+        if not data.empty and len(data) > 20:
+            if data.index.tz is not None:
+                data.index = data.index.tz_localize(None)
+            return data
+    except: pass
     
-    for t in targets:
-        cache_path = os.path.join(CACHE_DIR, f"{t}.csv")
-        today = get_taiwan_time().date()
-        
-        try:
-            # 1. 嘗試讀取快取
-            if os.path.exists(cache_path):
-                try:
-                    df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-                    if not df_old.empty:
-                        last_date = df_old.index[-1].date()
-                        if last_date >= today - timedelta(days=1):
-                             return df_old
-
-                        if last_date < today:
-                            start_date = last_date + timedelta(days=1)
-                            if start_date <= today:
-                                df_new = yf.Ticker(t).history(start=start_date)
-                                if not df_new.empty:
-                                    df_new.index = df_new.index.tz_localize(None)
-                                    df_final = pd.concat([df_old, df_new])
-                                    df_final = df_final[~df_final.index.duplicated(keep='last')]
-                                    df_final.to_csv(cache_path)
-                                    return df_final
-                                else:
-                                    return df_old # 連線失敗回傳舊資料
-                except: pass
-
-            # 2. 無快取，下載新資料
-            data = yf.Ticker(t).history(period=period)
-            if len(data) > 20: 
-                if data.index.tz is not None:
-                    data.index = data.index.tz_localize(None)
-                data.to_csv(cache_path)
-                return data
-                
-        except: pass
-        
     return None
 
 def add_technical_indicators(data_df):
@@ -250,27 +223,19 @@ def fetch_stock_data(ticker, period="5y"):
         return add_technical_indicators(df)
     return None
 
+# 基本面 (yfinance info)
 def get_stock_fundamentals_safe(ticker):
     try:
-        # 修正：基本面查詢也支援自動切換後輟
         stock = yf.Ticker(ticker)
+        # 嘗試直接獲取，失敗不報錯
         try:
             info = stock.info
-            # 若第一種後輟抓不到，嘗試切換
-            if not info or 'trailingEps' not in info:
-                if ".TW" in ticker:
-                    stock = yf.Ticker(ticker.replace(".TW", ".TWO"))
-                    info = stock.info
-                elif ".TWO" in ticker:
-                    stock = yf.Ticker(ticker.replace(".TWO", ".TW"))
-                    info = stock.info
-            
+            if not info: return None, None, None
             eps = info.get('trailingEps', None)
             pe = info.get('trailingPE', None)
             roe = info.get('returnOnEquity', None)
             return eps, pe, roe
-        except:
-            return None, None, None
+        except: return None, None, None
     except: return None, None, None
 
 # --- 營收 (MOPS) ---
@@ -294,7 +259,7 @@ def get_revenue_data_snapshot():
         has_data = False
         for url in urls:
             try:
-                res = requests.get(url, headers=HEADERS, timeout=3, verify=False)
+                res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
                 res.encoding = 'utf-8'
                 dfs = pd.read_html(res.text)
                 for df in dfs:
@@ -320,7 +285,7 @@ def get_revenue_data_snapshot():
             except: pass
         if has_data: return revenue_map, f"{roc_year}/{month}"
         target_month = target_month.replace(day=1) - timedelta(days=1)
-    return {}, "無資料(逾時)"
+    return {}, "無資料"
 
 # --- 融資 ---
 @st.cache_data(ttl=3600)
@@ -742,13 +707,6 @@ try:
 
     st.sidebar.header("🔧 系統診斷 / 通知")
     line_token = st.sidebar.text_input("🔔 Line Notify Token (選填)", type="password")
-
-    if st.sidebar.button("🗑️ 清除快取 (強制重抓)"):
-        import shutil
-        if os.path.exists(CACHE_DIR):
-            shutil.rmtree(CACHE_DIR)
-            os.makedirs(CACHE_DIR)
-        st.sidebar.success("快取已清空！")
 
     if st.sidebar.button("🛠️ 測試連線"):
         with st.sidebar.status("測試中..."):
