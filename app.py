@@ -8,6 +8,7 @@ import os
 import requests
 import feedparser
 import urllib3
+import shutil
 from collections import Counter
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -18,13 +19,18 @@ from plotly.subplots import make_subplots
 # 0. 系統設定
 # ==========================================
 try:
-    st.set_page_config(page_title="黑武士・全能戰情室", layout="wide", page_icon="⚔️")
+    st.set_page_config(page_title="黑武士・全能戰情室 (上市版)", layout="wide", page_icon="⚔️")
 except: pass
 
-# 忽略 SSL 警告
+# 忽略 SSL 警告 (解決爬蟲報錯)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HISTORY_FILE = "screening_history.csv"
+CACHE_DIR = "stock_cache"
+
+# 確保快取目錄存在
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
 
 # 白名單
 VALID_STRATEGIES = [
@@ -102,7 +108,7 @@ def clear_history():
 clean_invalid_data()
 
 # ==========================================
-# 2. 數據獲取
+# 2. 數據獲取 (僅限上市 TWSE)
 # ==========================================
 
 @st.cache_data(ttl=86400)
@@ -111,9 +117,9 @@ def get_tw_stock_list():
         codes = twstock.codes
         tw_list = []
         for code in codes:
-            if codes[code].type == "股票":
-                suffix = ".TW" if codes[code].market == "上市" else ".TWO"
-                tw_list.append(f"{code}{suffix}")
+            # ★★★ 修正：只抓取「上市」股票 ★★★
+            if codes[code].type == "股票" and codes[code].market == "上市":
+                tw_list.append(f"{code}.TW")
         return tw_list
     except: return []
 
@@ -175,33 +181,45 @@ def calculate_rsi(data, window=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ★★★ 修正：移除快取，改為直接下載 + 智慧後綴切換 ★★★
-def fetch_raw_data(ticker, period="1y"):
-    # 1. 嘗試原始代號
+# 抓取原始數據 (智慧快取 - 只針對 .TW)
+def fetch_raw_data(ticker, period="2y"):
+    ticker = ticker.strip().upper()
+    if not ticker.endswith(".TW"): ticker = f"{ticker}.TW"
+    
+    cache_path = os.path.join(CACHE_DIR, f"{ticker}.csv")
+    today = get_taiwan_time().date()
+    
     try:
+        # 1. 嘗試讀取本地快取
+        if os.path.exists(cache_path):
+            try:
+                df_old = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+                if not df_old.empty:
+                    last_date = df_old.index[-1].date()
+                    if last_date >= today - timedelta(days=1):
+                         return df_old
+
+                    if last_date < today:
+                        start_date = last_date + timedelta(days=1)
+                        if start_date <= today:
+                            df_new = yf.Ticker(ticker).history(start=start_date)
+                            if not df_new.empty:
+                                df_new.index = df_new.index.tz_localize(None)
+                                df_final = pd.concat([df_old, df_new])
+                                df_final = df_final[~df_final.index.duplicated(keep='last')]
+                                df_final.to_csv(cache_path)
+                                return df_final
+                            else: return df_old
+            except: pass
+
+        # 2. 無快取，下載新資料
         data = yf.Ticker(ticker).history(period=period)
-        if not data.empty and len(data) > 20:
+        if len(data) > 20: 
             if data.index.tz is not None:
                 data.index = data.index.tz_localize(None)
+            data.to_csv(cache_path)
             return data
     except: pass
-    
-    # 2. 嘗試切換後綴 (TW <-> TWO)
-    try:
-        if ".TW" in ticker:
-            alt_ticker = ticker.replace(".TW", ".TWO")
-        elif ".TWO" in ticker:
-            alt_ticker = ticker.replace(".TWO", ".TW")
-        else:
-            return None
-            
-        data = yf.Ticker(alt_ticker).history(period=period)
-        if not data.empty and len(data) > 20:
-            if data.index.tz is not None:
-                data.index = data.index.tz_localize(None)
-            return data
-    except: pass
-    
     return None
 
 def add_technical_indicators(data_df):
@@ -226,10 +244,8 @@ def fetch_stock_data(ticker, period="5y"):
 def get_stock_fundamentals_safe(ticker):
     try:
         stock = yf.Ticker(ticker)
-        # 嘗試直接獲取，失敗不報錯
         try:
             info = stock.info
-            if not info: return None, None, None
             eps = info.get('trailingEps', None)
             pe = info.get('trailingPE', None)
             roe = info.get('returnOnEquity', None)
@@ -237,7 +253,7 @@ def get_stock_fundamentals_safe(ticker):
         except: return None, None, None
     except: return None, None, None
 
-# --- 營收 (MOPS) ---
+# --- 營收 (MOPS - 僅上市) ---
 @st.cache_data(ttl=3600)
 def get_revenue_data_snapshot():
     date_obj = get_taiwan_time()
@@ -251,64 +267,41 @@ def get_revenue_data_snapshot():
         roc_year = target_month.year - 1911
         month = target_month.month
         revenue_map = {}
-        urls = [
-            f"https://mops.twse.com.tw/nas/t21/sii/t21sc03_{roc_year}_{month}_0.html",
-            f"https://mops.twse.com.tw/nas/t21/otc/t21sc03_{roc_year}_{month}_0.html" 
-        ]
+        # ★★★ 修正：只抓取上市 (sii) 的營收 ★★★
+        url = f"https://mops.twse.com.tw/nas/t21/sii/t21sc03_{roc_year}_{month}_0.html"
         has_data = False
-        for url in urls:
-            try:
-                res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
-                res.encoding = 'utf-8'
-                dfs = pd.read_html(res.text)
-                for df in dfs:
-                    if df.shape[1] > 5 and '公司代號' in str(df.columns):
-                        df.columns = [str(c).replace(' ','') for c in df.columns] 
-                        col_code = None
-                        col_yoy = None
-                        col_mom = None
-                        for i, col in enumerate(df.columns):
-                            if '代號' in col: col_code = col
-                            if '去年' in col and '%' in col: col_yoy = col
-                            if '上月' in col and '%' in col: col_mom = col
-                        if col_code and col_yoy:
-                            for _, row in df.iterrows():
-                                try:
-                                    code = str(row[col_code])
-                                    if code == 'nan' or code == '合計': continue
-                                    yoy = float(str(row[col_yoy]).replace(',',''))
-                                    mom = float(str(row[col_mom]).replace(',','')) if col_mom else 0.0
-                                    revenue_map[code] = {'yoy': yoy, 'mom': mom}
-                                    has_data = True
-                                except: continue
-            except: pass
+        
+        try:
+            res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
+            res.encoding = 'utf-8'
+            dfs = pd.read_html(res.text)
+            for df in dfs:
+                if df.shape[1] > 5 and '公司代號' in str(df.columns):
+                    df.columns = [str(c).replace(' ','') for c in df.columns] 
+                    col_code = None
+                    col_yoy = None
+                    col_mom = None
+                    for i, col in enumerate(df.columns):
+                        if '代號' in col: col_code = col
+                        if '去年' in col and '%' in col: col_yoy = col
+                        if '上月' in col and '%' in col: col_mom = col
+                    if col_code and col_yoy:
+                        for _, row in df.iterrows():
+                            try:
+                                code = str(row[col_code])
+                                if code == 'nan' or code == '合計': continue
+                                yoy = float(str(row[col_yoy]).replace(',',''))
+                                mom = float(str(row[col_mom]).replace(',','')) if col_mom else 0.0
+                                revenue_map[code] = {'yoy': yoy, 'mom': mom}
+                                has_data = True
+                            except: continue
+        except: pass
+        
         if has_data: return revenue_map, f"{roc_year}/{month}"
         target_month = target_month.replace(day=1) - timedelta(days=1)
     return {}, "無資料"
 
-# --- 融資 ---
-@st.cache_data(ttl=3600)
-def get_tpex_margin_data_snapshot(date_obj):
-    roc_year = int(date_obj.strftime('%Y')) - 1911
-    date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
-    url = f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={date_str}&s=0,asc,0"
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
-        data = res.json()
-        if 'aaData' in data:
-            margin_dict = {}
-            for row in data['aaData']:
-                try:
-                    code = row[0]
-                    today_bal = int(row[6].replace(',', ''))
-                    yest_bal = int(row[2].replace(',', ''))
-                    net_change = (today_bal - yest_bal) / 1000 
-                    margin_dict[code] = net_change
-                except: continue
-            return margin_dict
-    except: pass
-    return {}
-
+# --- 融資 (僅上市 TWSE) ---
 @st.cache_data(ttl=3600)
 def get_margin_data_snapshot():
     date_obj = get_taiwan_time()
@@ -318,7 +311,6 @@ def get_margin_data_snapshot():
             date_obj -= timedelta(days=1); continue
         date_str = date_obj.strftime('%Y%m%d')
         
-        twse_dict = {}
         try:
             url = f"https://www.twse.com.tw/rwd/zh/margin/MI_MARGN?date={date_str}&selectType=STOCK&response=json"
             res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
@@ -330,39 +322,12 @@ def get_margin_data_snapshot():
                         for col in ['融資前日餘額', '融資今日餘額']:
                              df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
                         df['net_change'] = (df['融資今日餘額'] - df['融資前日餘額']) / 1000
-                        twse_dict = df.set_index('股票代號')['net_change'].to_dict()
-                        break
+                        return df.set_index('股票代號')['net_change'].to_dict()
         except: pass
-
-        tpex_dict = get_tpex_margin_data_snapshot(date_obj)
-        if twse_dict or tpex_dict:
-            twse_dict.update(tpex_dict)
-            return twse_dict
-            
         date_obj -= timedelta(days=1)
     return {}
 
-# --- 籌碼 ---
-@st.cache_data(ttl=3600)
-def get_tpex_chip_data_snapshot(date_obj):
-    roc_year = int(date_obj.strftime('%Y')) - 1911
-    date_str = f"{roc_year}/{date_obj.strftime('%m/%d')}"
-    url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D&d={date_str}"
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
-        data = res.json()
-        if 'aaData' in data:
-            chip_dict = {}
-            for row in data['aaData']:
-                code = row[0]
-                try:
-                    net_buy = int(row[-1].replace(',', '')) 
-                    chip_dict[code] = net_buy
-                except: continue
-            return chip_dict
-    except: pass
-    return {}
-
+# --- 籌碼 (僅上市 TWSE) ---
 @st.cache_data(ttl=3600)
 def get_chip_data_snapshot():
     date_obj = get_taiwan_time()
@@ -372,7 +337,6 @@ def get_chip_data_snapshot():
             date_obj -= timedelta(days=1); continue
         date_str_twse = date_obj.strftime('%Y%m%d')
         
-        twse_dict = {}
         try:
             url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_str_twse}&selectType=ALL&response=json"
             res = requests.get(url, headers=HEADERS, timeout=5, verify=False)
@@ -380,14 +344,8 @@ def get_chip_data_snapshot():
             if data['stat'] == 'OK':
                 df = pd.DataFrame(data['data'], columns=data['fields'])
                 df['三大法人買賣超股數'] = pd.to_numeric(df['三大法人買賣超股數'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-                twse_dict = df.set_index('證券代號')['三大法人買賣超股數'].to_dict()
+                return df.set_index('證券代號')['三大法人買賣超股數'].to_dict(), date_str_twse
         except: pass
-
-        tpex_dict = get_tpex_chip_data_snapshot(date_obj)
-        if twse_dict or tpex_dict:
-            twse_dict.update(tpex_dict)
-            return twse_dict, date_str_twse
-            
         date_obj -= timedelta(days=1)
     return {}, "無資料"
 
@@ -707,6 +665,13 @@ try:
     st.sidebar.header("🔧 系統診斷 / 通知")
     line_token = st.sidebar.text_input("🔔 Line Notify Token (選填)", type="password")
 
+    if st.sidebar.button("🗑️ 清除快取 (強制重抓)"):
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+            os.makedirs(CACHE_DIR)
+        st.sidebar.success("快取已清空！")
+
     if st.sidebar.button("🛠️ 測試連線"):
         with st.sidebar.status("測試中..."):
             try:
@@ -820,12 +785,14 @@ try:
 
                 if match_result:
                     code = ticker.split('.')[0]
+                    # 5. 避雷針檢查
                     if exclude_margin_surge:
                         m_change = margin_map.get(code, 0)
                         if m_change > 500:
                              if debug_stock and debug_stock in ticker: st.write(f"❌ 融資爆增 ({m_change}張) -> 剔除")
                              continue
                     
+                    # 6. 營收檢查 (預設 -100 不過濾)
                     rev_data = rev_map.get(code, {'yoy': 0, 'mom': 0})
                     if rev_data['yoy'] < min_revenue_yoy:
                         if debug_stock and debug_stock in ticker: st.write(f"❌ 營收成長不足 ({rev_data['yoy']}%) -> 剔除")
@@ -834,7 +801,7 @@ try:
                     eps, pe, _ = get_stock_fundamentals_safe(ticker)
                     
                     if exclude_negative_pe:
-                        if eps is not None and eps < 0:
+                        if (eps is not None and eps < 0) or (pe is None):
                              if debug_stock and debug_stock in ticker: st.write(f"❌ 虧損股 (EPS {eps}) -> 剔除")
                              continue
                     
@@ -1154,4 +1121,3 @@ try:
 
 except Exception as e:
     st.error(f"發生錯誤: {e}")
-
